@@ -1,0 +1,1053 @@
+{
+  "name": "Crypto Futures Setup Scanner Testing 2.0 COPY",
+  "nodes": [
+    {
+      "parameters": {
+        "url": "https://api.coingecko.com/api/v3/global",
+        "options": {}
+      },
+      "id": "01e1ac60-2ab2-4688-ac9e-1fc7626e8538",
+      "name": "CoinGecko Global",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        384,
+        128
+      ]
+    },
+    {
+      "parameters": {
+        "url": "https://api.bitget.com/api/v2/mix/market/contracts?productType=usdt-futures",
+        "options": {}
+      },
+      "id": "3213b53e-86b1-472b-be45-8169a266cd98",
+      "name": "Bitget Contracts",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        608,
+        128
+      ]
+    },
+    {
+      "parameters": {
+        "operation": "get",
+        "dataTableId": {
+          "__rl": true,
+          "value": "QC83k8hCOfM7Vazk",
+          "mode": "list",
+          "cachedResultName": "Crypto Derivatives History for Tester2",
+          "cachedResultUrl": "/projects/PGcyPJFZfgLHVw8U/datatables/QC83k8hCOfM7Vazk"
+        },
+        "filters": {
+          "conditions": []
+        },
+        "returnAll": true,
+        "orderBy": true,
+        "orderByColumn": "captured_at"
+      },
+      "id": "1520dfb1-67d4-4a31-b062-b917c8e5dff0",
+      "name": "Read Last Dominance",
+      "type": "n8n-nodes-base.dataTable",
+      "typeVersion": 1.1,
+      "position": [
+        832,
+        128
+      ],
+      "alwaysOutputData": true
+    },
+    {
+      "parameters": {
+        "jsCode": "/* =====================================================================\n   COMPUTE DOMINANCE  (n8n Code node, \"Run Once for All Items\")\n   Input  : rows from \"Read Last Dominance\" (history)\n   Changes: looked up by captured_at TIMESTAMP (not by row count), so it works\n            with any schedule (the old version assumed 15m rows, but the\n            workflow runs hourly, which made \"24h\" really ~4 days)\n   New    : USDT dominance, USDT market cap, usdt_signal\n   ===================================================================== */\nconst LF = '\\n';\nconst g = $('CoinGecko Global').first().json?.data || {};\n\n/* null/undefined/'' stay null (Number(null) would wrongly give 0) */\nconst num = x => {\n  if (x === null || x === undefined || x === '') return null;\n  const n = Number(x);\n  return Number.isFinite(n) ? n : null;\n};\n\n/* ---------------- current values ---------------- */\nconst totalMcap = num(g.total_market_cap?.usd);\nconst btcD  = num(g.market_cap_percentage?.btc);\nconst ethD  = num(g.market_cap_percentage?.eth);\nconst usdtD = num(g.market_cap_percentage?.usdt);\n\nconst mc = d => (totalMcap != null && d != null ? totalMcap * d / 100 : null);\nconst btcMcap = mc(btcD), ethMcap = mc(ethD), usdtMcap = mc(usdtD);\nconst total2 = totalMcap != null && btcMcap != null ? totalMcap - btcMcap : null;\nconst total3 = total2 != null && ethMcap != null ? total2 - ethMcap : null;\n\n/* ---------------- history, looked up by time ---------------- */\nconst now = Date.now();\nconst history = $input.all()\n  .map(i => i.json)\n  .filter(r => r && r.captured_at)\n  .map(r => ({ ...r, _t: new Date(r.captured_at).getTime() }))\n  .filter(r => Number.isFinite(r._t))\n  .sort((a, b) => a._t - b._t);\n\n/* row closest to \"hours ago\", only if it is within a sensible tolerance */\nfunction rowAgo(hours) {\n  const target = now - hours * 3600e3;\n  const tol = Math.min(2, Math.max(0.75, hours * 0.15)) * 3600e3;\n  let best = null, bd = Infinity;\n  for (const r of history) {\n    const d = Math.abs(r._t - target);\n    if (d < bd) { bd = d; best = r; }\n  }\n  return bd <= tol ? best : null;\n}\nconst row1h = rowAgo(1), row4h = rowAgo(4), row24h = rowAgo(24);\n\nfunction pct(cur, old) {\n  cur = num(cur); old = num(old);\n  if (cur == null || old == null || old === 0) return null;\n  return (cur - old) / old * 100;\n}\n\nconst btcD1h = pct(btcD, row1h?.btc_d),   btcD4h = pct(btcD, row4h?.btc_d),   btcD24h = pct(btcD, row24h?.btc_d);\nconst total2_1h = pct(total2, row1h?.total2), total2_4h = pct(total2, row4h?.total2), total2_24h = pct(total2, row24h?.total2);\nconst total3_1h = pct(total3, row1h?.total3), total3_4h = pct(total3, row4h?.total3), total3_24h = pct(total3, row24h?.total3);\n\n/* USDT (these columns are empty in old rows, so they stay null until ~24h of new data exists) */\nconst usdtD1h = pct(usdtD, row1h?.usdt_d), usdtD4h = pct(usdtD, row4h?.usdt_d), usdtD24h = pct(usdtD, row24h?.usdt_d);\nconst usdtMcap24h = pct(usdtMcap, row24h?.usdt_mcap);\n\n/* ---------------- USDT signal ----------------\n   USDT.D also rises just because other coins fall (USDT is stable, so its share goes up).\n   So we also look at USDT's own market cap:\n     FLIGHT_TO_USDT : USDT.D rising AND USDT market cap growing  -> real money moving into USDT\n     PRICE_DRIVEN   : USDT.D rising but USDT market cap flat     -> mostly just the market falling\n     DEPLOYING      : USDT.D falling                              -> money leaving USDT into crypto\n*/\nconst U = { riseD: 1, fallD: -1, mcapInflow: 0.1 };   // relative % over 24h (tune after paper-testing)\nlet usdtSignal = 'UNKNOWN';\nif (usdtD24h != null) {\n  if (usdtD24h > U.riseD) usdtSignal = (usdtMcap24h != null && usdtMcap24h >= U.mcapInflow) ? 'FLIGHT_TO_USDT' : 'PRICE_DRIVEN';\n  else if (usdtD24h < U.fallD) usdtSignal = 'DEPLOYING';\n  else usdtSignal = 'NEUTRAL';\n}\n\n/* ---------------- macro regime ---------------- */\nlet macroRegime = 'MIXED', macroScore = 0;\n\nif (btcD24h < -0.2 && total2_24h > 2 && total3_24h > 2) {\n  macroRegime = 'ALT_BULL'; macroScore = 3;\n}\nelse if (btcD24h > 0.2 && total2_24h > 1) {\n  macroRegime = 'BTC_BULL'; macroScore = 2;\n}\nelse if ((btcD24h > 0.2 && total2_24h < -2 && total3_24h < -2) ||\n         (usdtSignal === 'FLIGHT_TO_USDT' && total2_24h < -2)) {      // new: real flight to USDT while alts fall\n  macroRegime = 'RISK_OFF'; macroScore = -3;\n}\nelse if (Math.abs(btcD24h) < 0.2 && total2_24h > 1 && total3_24h > 1) {\n  macroRegime = 'ACCUMULATION'; macroScore = 1;\n}\n\n/* USDT nudges the score (does not change the regime by itself) */\nif (macroRegime !== 'RISK_OFF') {\n  if (usdtSignal === 'FLIGHT_TO_USDT') macroScore -= 1;\n  else if (usdtSignal === 'DEPLOYING') macroScore += 1;\n}\n\nconst f = x => (x == null ? 'n/a' : (x > 0 ? '+' : '') + x.toFixed(2) + '%');\n\nconst context = [\n  `Macro Regime: ${macroRegime}`,\n  `BTC.D 1H/4H/24H: ${f(btcD1h)} / ${f(btcD4h)} / ${f(btcD24h)}`,\n  `TOTAL2 24H: ${f(total2_24h)}`,\n  `TOTAL3 24H: ${f(total3_24h)}`,\n  `USDT.D: ${usdtD == null ? 'n/a' : usdtD.toFixed(2) + '%'} (4H ${f(usdtD4h)}, 24H ${f(usdtD24h)})`,\n  `USDT mcap 24H: ${f(usdtMcap24h)}`,\n  `USDT signal: ${usdtSignal}`\n].join(LF);\n\nreturn [{\n  json: {\n    captured_at: new Date().toISOString(),\n\n    total_mcap: totalMcap,\n    btc_d: btcD,\n    total2,\n    total3,\n    usdt_d: usdtD,\n    usdt_mcap: usdtMcap,\n\n    btcD_1h_change: btcD1h,\n    btcD_4h_change: btcD4h,\n    btcD_24h_change: btcD24h,\n\n    total2_1h_change: total2_1h,\n    total2_4h_change: total2_4h,\n    total2_24h_change: total2_24h,\n\n    total3_1h_change: total3_1h,\n    total3_4h_change: total3_4h,\n    total3_24h_change: total3_24h,\n\n    usdtD_1h_change: usdtD1h,\n    usdtD_4h_change: usdtD4h,\n    usdtD_24h_change: usdtD24h,\n    usdt_mcap_24h_change: usdtMcap24h,\n    usdt_signal: usdtSignal,\n\n    macro_score: macroScore,\n    macro_regime: macroRegime,\n    context\n  }\n}];"
+      },
+      "id": "61c52f3f-43ac-4504-a78e-73c035837de1",
+      "name": "Compute Dominance",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1056,
+        128
+      ]
+    },
+    {
+      "parameters": {
+        "dataTableId": {
+          "__rl": true,
+          "value": "QC83k8hCOfM7Vazk",
+          "mode": "list",
+          "cachedResultName": "Crypto Derivatives History for Tester2",
+          "cachedResultUrl": "/projects/PGcyPJFZfgLHVw8U/datatables/QC83k8hCOfM7Vazk"
+        },
+        "columns": {
+          "mappingMode": "defineBelow",
+          "value": {
+            "captured_at": "={{ $json.captured_at }}",
+            "total_mcap": "={{ $json.total_mcap }}",
+            "btc_d": "={{ $json.btc_d }}",
+            "total2": "={{ $json.total2 }}",
+            "total3": "={{ $json.total3 }}",
+            "macro_score": "={{ $json.macro_score }}",
+            "macro_regime": "={{ $json.macro_regime }}",
+            "context": "={{ $json.context }}",
+            "btcD_1h_change": "={{ $json.btcD_1h_change }}",
+            "btcD_4h_change": "={{ $json.btcD_4h_change }}",
+            "btcD_24h_change": "={{ $json.btcD_24h_change }}",
+            "total2_1h_change": "={{ $json.total2_1h_change }}",
+            "total2_4h_change": "={{ $json.total2_4h_change }}",
+            "total2_24h_change": "={{ $json.total2_24h_change }}",
+            "total3_1h_change": "={{ $json.total3_1h_change }}",
+            "total3_4h_change": "={{ $json.total3_4h_change }}",
+            "total3_24h_change": "={{ $json.total3_24h_change }}",
+            "usdt_d": "={{ $json.usdt_d }}",
+            "usdt_mcap": "={{ $json.usdt_mcap }}",
+            "usdtD_1h_change": "={{ $json.usdtD_1h_change }}",
+            "usdtD_4h_change": "={{ $json.usdtD_4h_change }}",
+            "usdtD_24h_change": "={{ $json.usdtD_24h_change }}",
+            "usdt_mcap_24h_change": "={{ $json.usdt_mcap_24h_change }}",
+            "usdt_signal": "={{ $json.usdt_signal }}"
+          },
+          "matchingColumns": [],
+          "schema": [
+            {
+              "id": "captured_at",
+              "displayName": "captured_at",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "dateTime",
+              "readOnly": false,
+              "removed": false
+            },
+            {
+              "id": "total_mcap",
+              "displayName": "total_mcap",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "number",
+              "readOnly": false,
+              "removed": false
+            },
+            {
+              "id": "btc_d",
+              "displayName": "btc_d",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "number",
+              "readOnly": false,
+              "removed": false
+            },
+            {
+              "id": "total2",
+              "displayName": "total2",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "number",
+              "readOnly": false,
+              "removed": false
+            },
+            {
+              "id": "total3",
+              "displayName": "total3",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "number",
+              "readOnly": false,
+              "removed": false
+            },
+            {
+              "id": "macro_score",
+              "displayName": "macro_score",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "number",
+              "readOnly": false,
+              "removed": false
+            },
+            {
+              "id": "context",
+              "displayName": "context",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "readOnly": false,
+              "removed": false
+            },
+            {
+              "id": "btcD_1h_change",
+              "displayName": "btcD_1h_change",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "number",
+              "readOnly": false,
+              "removed": false
+            },
+            {
+              "id": "btcD_4h_change",
+              "displayName": "btcD_4h_change",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "number",
+              "readOnly": false,
+              "removed": false
+            },
+            {
+              "id": "btcD_24h_change",
+              "displayName": "btcD_24h_change",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "number",
+              "readOnly": false,
+              "removed": false
+            },
+            {
+              "id": "total2_1h_change",
+              "displayName": "total2_1h_change",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "number",
+              "readOnly": false,
+              "removed": false
+            },
+            {
+              "id": "total2_4h_change",
+              "displayName": "total2_4h_change",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "number",
+              "readOnly": false,
+              "removed": false
+            },
+            {
+              "id": "total2_24h_change",
+              "displayName": "total2_24h_change",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "number",
+              "readOnly": false,
+              "removed": false
+            },
+            {
+              "id": "total3_1h_change",
+              "displayName": "total3_1h_change",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "number",
+              "readOnly": false,
+              "removed": false
+            },
+            {
+              "id": "total3_4h_change",
+              "displayName": "total3_4h_change",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "number",
+              "readOnly": false,
+              "removed": false
+            },
+            {
+              "id": "total3_24h_change",
+              "displayName": "total3_24h_change",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "number",
+              "readOnly": false,
+              "removed": false
+            },
+            {
+              "id": "usdt_d",
+              "displayName": "usdt_d",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "number",
+              "readOnly": false,
+              "removed": false
+            },
+            {
+              "id": "usdt_mcap",
+              "displayName": "usdt_mcap",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "number",
+              "readOnly": false,
+              "removed": false
+            },
+            {
+              "id": "usdtD_1h_change",
+              "displayName": "usdtD_1h_change",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "number",
+              "readOnly": false,
+              "removed": false
+            },
+            {
+              "id": "usdtD_4h_change",
+              "displayName": "usdtD_4h_change",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "number",
+              "readOnly": false,
+              "removed": false
+            },
+            {
+              "id": "usdtD_24h_change",
+              "displayName": "usdtD_24h_change",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "number",
+              "readOnly": false,
+              "removed": false
+            },
+            {
+              "id": "usdt_mcap_24h_change",
+              "displayName": "usdt_mcap_24h_change",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "number",
+              "readOnly": false,
+              "removed": false
+            },
+            {
+              "id": "usdt_signal",
+              "displayName": "usdt_signal",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "readOnly": false,
+              "removed": false
+            },
+            {
+              "id": "macro_regime",
+              "displayName": "macro_regime",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "readOnly": false,
+              "removed": false
+            }
+          ],
+          "attemptToConvertTypes": false,
+          "convertFieldsToString": false
+        },
+        "options": {}
+      },
+      "id": "eee70614-93ac-4e93-9e2a-3863286d4fbb",
+      "name": "Save Dominance",
+      "type": "n8n-nodes-base.dataTable",
+      "typeVersion": 1.1,
+      "position": [
+        1280,
+        128
+      ]
+    },
+    {
+      "parameters": {
+        "url": "https://api.coingecko.com/api/v3/coins/markets?vs_currency=usd&order=market_cap_desc&per_page=50&page=1&sparkline=false",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "User-Agent",
+              "value": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"
+            },
+            {
+              "name": "Accept",
+              "value": "application/json"
+            }
+          ]
+        },
+        "options": {}
+      },
+      "id": "a0681778-a4b9-4b40-9bf6-95a3d274b747",
+      "name": "CoinGecko Markets",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        1504,
+        128
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "// Fixed watchlist; validates that each Bitget USDT perpetual exists.\nconst WATCHLIST=['BTC','ETH','SOL','XRP','HYPE','ZEC','DOGE','BNB','SUI','LINK','NEAR','PUMP','ADA','TAO','ENA','ASTER','WLD'];\nconst contracts=$('Bitget Contracts').first().json?.data||[];\nconst bySymbol=new Map(contracts.map(c=>[String(c.symbol||'').toUpperCase(),c]));\nconst out=[];\nfor(let i=0;i<WATCHLIST.length;i++){\n  const base=WATCHLIST[i], symbol=`${base}USDT`, c=bySymbol.get(symbol);\n  if(!c) continue;\n  out.push({json:{symbol,baseCoin:base,productType:'usdt-futures',watchlistOrder:i+1,status:c.symbolStatus??c.status??null,minTradeNum:c.minTradeNum??null,pricePlace:c.pricePlace??null,volumePlace:c.volumePlace??null}});\n}\nreturn out;"
+      },
+      "id": "2dc373bf-4765-4198-84ff-f1a47f7c89a3",
+      "name": "Build Symbols",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1728,
+        128
+      ]
+    },
+    {
+      "parameters": {
+        "url": "=https://api.bitget.com/api/v2/mix/market/candles?symbol={{ $(\"Build Symbols\").item.json.symbol }}&granularity=4H&productType=usdt-futures&limit=300",
+        "options": {
+          "batching": {
+            "batch": {
+              "batchSize": 1,
+              "batchInterval": 500
+            }
+          }
+        }
+      },
+      "id": "f5472ead-dabd-4b7e-a71c-1aa5a18e0c8a",
+      "name": "Candles 4h",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        2448,
+        144
+      ],
+      "retryOnFail": true,
+      "waitBetweenTries": 2000,
+      "onError": "continueRegularOutput"
+    },
+    {
+      "parameters": {
+        "url": "=https://api.bitget.com/api/v2/mix/market/candles?symbol={{ $(\"Build Symbols\").item.json.symbol }}&granularity=1H&productType=usdt-futures&limit=300",
+        "options": {
+          "batching": {
+            "batch": {
+              "batchSize": 1,
+              "batchInterval": 500
+            }
+          }
+        }
+      },
+      "id": "b2bf8021-cdfa-4275-b44e-fcb7873d88a4",
+      "name": "Candles 1h",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        2592,
+        128
+      ],
+      "retryOnFail": true,
+      "waitBetweenTries": 2000,
+      "onError": "continueRegularOutput"
+    },
+    {
+      "parameters": {
+        "url": "=https://api.bitget.com/api/v2/mix/market/candles?symbol={{ $(\"Build Symbols\").item.json.symbol }}&granularity=15m&productType=usdt-futures&limit=300",
+        "options": {
+          "batching": {
+            "batch": {
+              "batchSize": 1,
+              "batchInterval": 500
+            }
+          }
+        }
+      },
+      "id": "42008328-eb55-4dff-b12b-689a6f4ceb27",
+      "name": "Candles 15m",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        2752,
+        144
+      ],
+      "retryOnFail": true,
+      "waitBetweenTries": 2000,
+      "onError": "continueRegularOutput"
+    },
+    {
+      "parameters": {
+        "url": "=https://api.bitget.com/api/v2/mix/market/open-interest?symbol={{ $(\"Build Symbols\").item.json.symbol }}&productType=usdt-futures",
+        "options": {
+          "batching": {
+            "batch": {
+              "batchSize": 1,
+              "batchInterval": 500
+            }
+          }
+        }
+      },
+      "id": "53c7f355-fbe1-4c54-8fc9-b83f2e77fb65",
+      "name": "Open Interest",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        2912,
+        144
+      ],
+      "retryOnFail": true,
+      "onError": "continueRegularOutput"
+    },
+    {
+      "parameters": {
+        "url": "=https://api.bitget.com/api/v2/mix/market/current-fund-rate?symbol={{ $(\"Build Symbols\").item.json.symbol }}&productType=usdt-futures",
+        "options": {
+          "batching": {
+            "batch": {
+              "batchSize": 1,
+              "batchInterval": 500
+            }
+          }
+        }
+      },
+      "id": "da9c0cd8-369a-4833-943c-4a067287de33",
+      "name": "Funding Rate",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        3072,
+        128
+      ],
+      "retryOnFail": true,
+      "onError": "continueRegularOutput"
+    },
+    {
+      "parameters": {
+        "jsCode": "/* INTRADAY SCREENER v2: original logic + volatility cap, real 15m cross, batch limit, cooldown, position size */\nconst input = $input.all(), out = [], LF = '\\n';\nconst S = $('Build Symbols').all(), C4 =$('Candles 4h').all(), C1 = $('Candles 1h').all(), C15 =$('Candles 15m').all(), F = $('Funding Rate').all(), OI =$('Open Interest').all();\n\nlet macro = {};\ntry { macro = $('Compute Dominance').first().json || {}; } catch (e) {}\n\nconst CFG = {\n  min4: 210, min1: 210, min15: 100, minScore: 75, minGap: 20, minVolRatio: 0.75,\n  minAtrPct: 0.25,\n  maxAtrPct: 1.0,          // v2: was 4. Skip alerts when 15m ATR is above 1% (market already spiking)\n  maxStopPct: 3,           // v2: skip alerts whose stop is wider than 3% of entry\n  crossLookback: 4,        // v2: Stoch RSI must have CROSSED within the last 4 closed 15m candles (1 hour)\n  maxSignalsPerSide: 2,    // v2: at most 2 longs and 2 shorts per run\n  cooldownHours: 6,        // v2: no repeat alert on the same coin + side for 6 hours (active workflow only)\n  riskUsd: 100,            // v2: amount you accept to lose if the stop is hit\n  leverage: { BTCUSDT: 40, default: 20 },   // v2: leverage you plan to use per coin (used for margin + liquidation check)\n  maintMarginPct: 0.5,     // v2: rough maintenance margin, used to estimate the liquidation distance\n  liqSafety: 0.8,          // v2: warn when the stop is further than 80% of the way to liquidation\n  useDailyTrend: true,     // v2: no longs when the Daily trend is down, no shorts when it is up (needs the Candles 1d nodes)\n  dailyStretchAtr: 3,      // v2: alert shows a warning when price is further than this many Daily ATRs from the Daily EMA50\n  minDaily: 210,           // v2: Daily candles needed for the Daily EMA200\n  maxLongFunding: .0005, minShortFunding: -.0005, rr: 2, atrStop: 1.5, maxStopAtr: 3\n};\n\n/* v2: Daily candles are optional. If the three Daily nodes are missing, the Daily rule is skipped. */\nconst DAILY = [];\nfor (const name of ['Candles 1d', 'Candles 1d older', 'Candles 1d older 2']) { try { DAILY.push($(name).all()); } catch (e) {} }\n\nconst num = x => Number.isFinite(Number(x)) ? Number(x) : null;\n\nfunction candles(raw) {\n  return Array.isArray(raw) ? raw.map(r => ({ t: num(r[0]), o: num(r[1]), h: num(r[2]), l: num(r[3]), c: num(r[4]), v: num(r[5]) })).filter(x => [x.t, x.o, x.h, x.l, x.c, x.v].every(Number.isFinite) && x.h >= x.l && x.c > 0).sort((a, b) => a.t - b.t) : [];\n}\n\nfunction emaSeries(a, p) {\n  if (a.length < p) return [];\n  let o = Array(a.length).fill(null), e = a.slice(0, p).reduce((s, x) => s + x, 0) / p, k = 2 / (p + 1);\n  o[p - 1] = e;\n  for (let i = p; i < a.length; i++) { e = a[i] * k + e * (1 - k); o[i] = e; }\n  return o;\n}\n\nfunction last(a, n = 0) { const v = a.filter(Number.isFinite); return v[v.length - 1 - n] ?? null; }\n\nfunction rsiSeries(a, p = 14) {\n  if (a.length < p + 1) return [];\n  let o = Array(a.length).fill(null), g = 0, l = 0;\n  for (let i = 1; i <= p; i++) { let d = a[i] - a[i - 1]; d >= 0 ? g += d : l -= d; }\n  g /= p; l /= p; o[p] = l === 0 ? 100 : 100 - 100 / (1 + g / l);\n  for (let i = p + 1; i < a.length; i++) {\n    let d = a[i] - a[i - 1], cg = Math.max(d, 0), cl = Math.max(-d, 0);\n    g = (g * (p - 1) + cg) / p; l = (l * (p - 1) + cl) / p;\n    o[i] = l === 0 ? 100 : 100 - 100 / (1 + g / l);\n  }\n  return o;\n}\n\nfunction sma(a, p) {\n  if (a.length < p) return [];\n  let o = [], s = 0;\n  for (let i = 0; i < a.length; i++) {\n    s += a[i]; if (i >= p) s -= a[i - p];\n    if (i >= p - 1) o.push(s / p);\n  }\n  return o;\n}\n\nfunction stoch(a) {\n  const r = rsiSeries(a).filter(Number.isFinite);\n  if (r.length < 20) return null;\n  let raw = [];\n  for (let i = 13; i < r.length; i++) {\n    let w = r.slice(i - 13, i + 1), mn = Math.min(...w), mx = Math.max(...w);\n    raw.push(mx === mn ? 50 : (r[i] - mn) / (mx - mn) * 100);\n  }\n  let k = sma(raw, 3), d = sma(k, 3);\n  if (k.length < 2 || d.length < 2) return null;\n  /* v2: how many closed candles ago K crossed D (0 = on the latest candle); null = no cross in the lookback */\n  const n = d.length, kk = k.slice(-n);\n  let upAgo = null, downAgo = null;\n  for (let b = 0; b < CFG.crossLookback && n - 2 - b >= 0; b++) {\n    const i = n - 1 - b;\n    if (upAgo === null && kk[i - 1] <= d[i - 1] && kk[i] > d[i]) upAgo = b;\n    if (downAgo === null && kk[i - 1] >= d[i - 1] && kk[i] < d[i]) downAgo = b;\n  }\n  return { k: last(k), pk: last(k, 1), d: last(d), pd: last(d, 1), upAgo, downAgo };\n}\n\nfunction atr(c, p = 14) {\n  if (c.length < p + 1) return null;\n  let tr = [];\n  for (let i = 1; i < c.length; i++) tr.push(Math.max(c[i].h - c[i].l, Math.abs(c[i].h - c[i - 1].c), Math.abs(c[i].l - c[i - 1].c)));\n  let a = tr.slice(0, p).reduce((s, x) => s + x, 0) / p;\n  for (let i = p; i < tr.length; i++) a = (a * (p - 1) + tr[i]) / p;\n  return a;\n}\n\nfunction avg(a) { a = a.filter(Number.isFinite); return a.length ? a.reduce((s, x) => s + x, 0) / a.length : null; }\nfunction swing(c, n) { c = c.slice(-n); return { hi: Math.max(...c.map(x => x.h)), lo: Math.min(...c.map(x => x.l)) }; }\nfunction marketStructure(candles, lookback = 40) {\n\n    if (!candles || candles.length < lookback)\n        return null;\n\n    const data =\n        candles.slice(-lookback);\n\n    const firstHalf =\n        data.slice(0, lookback / 2);\n\n    const secondHalf =\n        data.slice(lookback / 2);\n\n    const prevHigh =\n        Math.max(\n            ...firstHalf.map(x => x.h)\n        );\n\n    const prevLow =\n        Math.min(\n            ...firstHalf.map(x => x.l)\n        );\n\n    const lastHigh =\n        Math.max(\n            ...secondHalf.map(x => x.h)\n        );\n\n    const lastLow =\n        Math.min(\n            ...secondHalf.map(x => x.l)\n        );\n\n    return {\n\n        higherHigh:\n            lastHigh > prevHigh,\n\n        lowerHigh:\n            lastHigh < prevHigh,\n\n        higherLow:\n            lastLow > prevLow,\n\n        lowerLow:\n            lastLow < prevLow,\n\n        prevHigh,\n        prevLow,\n        lastHigh,\n        lastLow\n\n    };\n}\n/* v2: Daily trend = price against the Daily EMA50 and EMA200, plus the EMA50 slope (closed Daily candles only) */\nfunction dailyTrend(i, livePrice) {\n  const seen = new Set();\n  const cd = candles(DAILY.flatMap(pg => pg[i]?.json?.data || [])).filter(c => !seen.has(c.t) && seen.add(c.t));\n  if (cd.length < CFG.minDaily) return { trend: 'UNKNOWN', candles: cd.length };\n  const a = cd.slice(0, -1), x = a.map(c => c.c);\n  const e50s = emaSeries(x, 50), e50 = last(e50s), e50p = last(e50s, 3), e200 = last(emaSeries(x, 200)), p = last(x), atD = atr(a);\n  if (![e50, e50p, e200, p, atD].every(Number.isFinite)) return { trend: 'UNKNOWN', candles: cd.length };\n  const trend = p > e200 && p > e50 && e50 >= e50p ? 'UP' : p < e200 && p < e50 && e50 <= e50p ? 'DOWN' : 'MIXED';\n  return { trend, candles: cd.length, ema50: e50, ema200: e200, lastClose: p, stretchAtr: (livePrice - e50) / atD };\n}\nfunction fmt(x) { return !Number.isFinite(x) ? 'n/a' : Math.abs(x) >= 100 ? x.toFixed(2) : Math.abs(x) >= 1 ? x.toFixed(3) : x.toFixed(5); }\n\nfor (let i = 0; i < input.length; i++) {\n  const symbol = S[i]?.json?.symbol || `UNKNOWN_${i}`, c4 = candles(C4[i]?.json?.data), c1 = candles(C1[i]?.json?.data), c15 = candles(C15[i]?.json?.data), reject = [], reasons = [];\n  let funding = 0; try { funding = num(F[i].json.data?.[0]?.fundingRate) ?? 0; } catch (e) {}\n  let openInterest = null; try { openInterest = num(OI[i].json.data?.openInterestList?.[0]?.size); } catch (e) {}\n\n  if (c4.length < CFG.min4 || c1.length < CFG.min1 || c15.length < CFG.min15) {\n    out.push({ json: { symbol, hasSetup: false, side: null, regime: 'UNCERTAIN', reject: [`Candles insufficient 4H=${c4.length},1H=${c1.length},15M=${c15.length}`], message: '' } });\n    continue;\n  }\n\n  const a4 = c4.slice(0, -1), a1 = c1.slice(0, -1), a15 = c15.slice(0, -1);\n  const x4 = a4.map(x => x.c), x1 = a1.map(x => x.c), x15 = a15.map(x => x.c);\n  const p4 = last(x4), p1 = last(x1), price = last(x15);\n  const e504 = last(emaSeries(x4, 50)), e504p = last(emaSeries(x4, 50), 3), e2004 = last(emaSeries(x4, 200));\n  const e501 = last(emaSeries(x1, 50)), e501p = last(emaSeries(x1, 50), 3), e2001 = last(emaSeries(x1, 200));\n  const e2015 = last(emaSeries(x15, 20)), e2015p = last(emaSeries(x15, 20), 1);\n  const r4 = last(rsiSeries(x4)), r1 = last(rsiSeries(x1)), r15 = last(rsiSeries(x15));\n  const st = stoch(x15), at = atr(a15), atPct = at && price ? (at / price) * 100 : null, prev = last(x15, 1);\n  const structure4 = marketStructure(a4);\n  const vr = a15.length >= 21 ? a15[a15.length - 1].v / avg(a15.slice(-21, -1).map(x => x.v)) : null;\n\n  const bullEMA =\n    p4 > e2004 &&\n    e504 > e2004 &&\n    r4 >= 50;\n\nconst bearEMA =\n    p4 < e2004 &&\n    e504 < e2004 &&\n    r4 <= 50;\n\nconst structureBull =\n    structure4 &&\n    structure4.higherHigh &&\n    structure4.higherLow;\n\nconst structureBear =\n    structure4 &&\n    structure4.lowerHigh &&\n    structure4.lowerLow;\n\nlet regime = 'RANGE';\n/* Strong bullish structure */\n  \nif (structureBull &&\n   r4 >= 55\n) {\n    regime = 'BULL';\n}\n/* Strong bearish structure */\nelse if (structureBear &&\n    r4 <= 45\n) {\n    regime = 'BEAR';\n}\n/* Momentum fallback */\nelse if (\n    r4 >= 60\n) {\n  regime = 'BULL';\n}\nelse if (\n    r4 <= 40\n) {\n  regime = 'BEAR';\n}\nelse {\n  regime = 'RANGE';\n}\n  const bull1 = p1 > e2001 && e501 > e2001 && e501 >= e501p && r1 >= 52, bear1 = p1 < e2001 && e501 < e2001 && e501 <= e501p && r1 <= 48;\n  /* v2: a fresh cross is required, and K must still be on the right side of D */\n  const bullTrig = !!st && st.upAgo !== null && st.k > st.d && price > e2015;\n  const bearTrig = !!st && st.downAgo !== null && st.k < st.d && price < e2015;\n  const volOK = vr >= CFG.minVolRatio, atrOK = atPct >= CFG.minAtrPct && atPct <= CFG.maxAtrPct;\n\n  let longScore = 0;\n  let shortScore = 0;\n  /* EMA trend score */\n  if (p4 > e2004) longScore += 15; \n  else shortScore += 15;\n  if (e504 > e2004) longScore += 15; \n  else shortScore += 15;\n  if (e504 > e504p) longScore += 10; \n  else shortScore += 10;\n  /* Market Structure score */\n  if(\n    structureBull\n){\n    longScore += 20;\n}\n\nif(\n    structureBear\n){\n    shortScore += 20;\n}\n/* Regime score */\nif(\n    regime === 'BULL'\n) {\n    longScore += 20;\n}\nelse if (\n    regime === 'BEAR'\n) {\n    shortScore += 20;\n}\n  if (r4 >= 65) longScore += 15;\n  else if (r4 >= 60) longScore += 10;\n  if (r4 <= 35) shortScore += 15;\n  else if (r4 <= 40) shortScore += 10;\n\n  if (bull1) longScore += 20;\n  if (bear1) shortScore += 20;\n  if (bullTrig) longScore += 30;\n  if (bearTrig) shortScore += 30;\n  if (volOK && price > prev) longScore += 15;\n  if (volOK && price < prev) shortScore += 15;\n\n  let longAllowed = true, shortAllowed = true;\n  if(regime === 'BEAR'){ longAllowed = false; } \n  if(regime === 'BULL'){ shortAllowed = false; }\n  if(regime === 'BEAR'){ \n    longScore -= 30; shortScore += 20; \n  } \n  else if(regime === 'BULL'){ \n    longScore += 20; shortScore -= 30; \n  }\n  \n  if(symbol === 'BTCUSDT') {\n    if(macro.macro_regime === 'BTC_BULL'){longScore +=15;}\n  }else{\n    switch (macro.macro_regime) {\n      case 'ALT_BULL':\n        longScore += 15;\n        break;\n      \n      case 'RISK_OFF':\n        shortScore += 20;\n        longScore -= 15;\n        longAllowed = false;\n        break;\n        \n      case 'ACCUMULATION':\n        longScore += 5;\n        break;\n    }\n  }\n\n  if (funding > CFG.maxLongFunding) longScore -= 10;\n  if (funding < CFG.minShortFunding) shortScore -= 10;\n  longScore = Math.max(0, Math.min(100, longScore));\n  shortScore = Math.max(0, Math.min(100, shortScore));\n  \n  const daily = dailyTrend(i, price);\n  if (CFG.useDailyTrend && daily.trend === 'DOWN') longAllowed = false;\n  if (CFG.useDailyTrend && daily.trend === 'UP') shortAllowed = false;\n  let side = null;\n  if (longAllowed && regime === 'BULL' && bull1 && bullTrig && volOK && atrOK && funding <= CFG.maxLongFunding && longScore >= CFG.minScore && longScore - shortScore >= CFG.minGap) side = 'long';\n  else if (shortAllowed && regime === 'BEAR' && bear1 && bearTrig && volOK && atrOK && funding >= CFG.minShortFunding && shortScore >= CFG.minScore && shortScore - longScore >= CFG.minGap) side = 'short';\n\n  if (!side) {\n    if (regime === 'RANGE') reject.push('4H RANGE');\n    if (CFG.useDailyTrend && ((regime === 'BULL' && daily.trend === 'DOWN') || (regime === 'BEAR' && daily.trend === 'UP'))) reject.push(`Daily trend is ${daily.trend}: no ${regime === 'BULL' ? 'longs' : 'shorts'} against it`);\n    if (!volOK) reject.push(`Volume ratio ${fmt(vr)} below threshold`);\n    if (!atrOK) reject.push(`ATR ${fmt(atPct)}% outside range`);\n    const want = regime === 'BULL' ? 'long' : regime === 'BEAR' ? 'short' : null;\n    if (want) {\n      if (!(want === 'long' ? bull1 : bear1)) reject.push('1H trend not confirmed');\n      if (!(want === 'long' ? bullTrig : bearTrig)) reject.push(st && (want === 'long' ? st.k > st.d && price > e2015 : st.k < st.d && price < e2015)\n        ? `15M trigger is stale: no Stoch RSI cross in the last ${CFG.crossLookback} candles` : '15M trigger missing');\n    }\n    reject.push('No aligned 4H/1H/15M setup');\n  }\n\n  let entry = null, sl = null, tp = null, trailPct = null, message = '', stopPct = null, qty = null, notional = null, lev = null, margin = null, liqPct = null, safeLev = null;\n  if (side) {\n    entry = price;\n    let sw = swing(a15, 20), risk = side === 'long' ? entry - sw.lo : sw.hi - entry;\n    risk = Math.max(CFG.atrStop * at,risk);\n    risk = Math.min(risk, CFG.maxStopAtr * at);\n    sl = side === 'long' ? entry - risk : entry + risk;\n    tp = side === 'long' ? entry + CFG.rr * risk : entry - CFG.rr * risk;\n    trailPct = Math.max(.5, Math.round(at / entry * 12000) / 100);\n    stopPct = risk / entry * 100;\n    qty = CFG.riskUsd / risk; notional = qty * entry;\n    lev = CFG.leverage[symbol] ?? CFG.leverage.default;\n    margin = notional / lev;\n    liqPct = 100 / lev - CFG.maintMarginPct;                     // approximate adverse move that liquidates an isolated position\n    safeLev = Math.max(1, Math.floor(100 / (stopPct / CFG.liqSafety + CFG.maintMarginPct)));\n    if (stopPct > CFG.maxStopPct) { reject.push(`Stop ${stopPct.toFixed(2)}% wider than ${CFG.maxStopPct}%`); side = null; }\n  }\n  if (side) {\n    if(side) {\n    reasons.push(`${regime} 4H`);\nreasons.push(`1H confirmed`);\nreasons.push(`15M Stoch RSI cross ${side === 'long' ? st.upAgo : st.downAgo} candle(s) ago + EMA20 trigger`);\nreasons.push(`Volume ${fmt(vr)}x`);\n    }\n    message = [`${side.toUpperCase()} setup: ${symbol} [v2]`, `Macro: ${macro.macro_regime}`, `4H Regime: ${regime}`, `Long Score: ${longScore}`, `Short Score: ${shortScore}`, `Entry ${fmt(entry)} | SL ${fmt(sl)} (${stopPct.toFixed(2)}%) | TP ${fmt(tp)}`, `Size for $${CFG.riskUsd} risk: ${fmt(qty)} ${symbol.replace('USDT', '')} (about $${Math.round(notional)} position)`, ...(() => { const st_ = daily.stretchAtr, far = Number.isFinite(st_) && (side === 'short' ? st_ < -CFG.dailyStretchAtr : st_ > CFG.dailyStretchAtr); return [daily.trend === 'UNKNOWN' ? `Daily trend: unknown (${daily.candles} Daily candles)` : `Daily trend: ${daily.trend} | price is ${Math.abs(st_).toFixed(1)} Daily ATR ${st_ < 0 ? 'below' : 'above'} EMA50`, ...(far ? [`WARNING: stretched on the Daily chart. ${side === 'short' ? 'Bounce' : 'Pullback'} risk is high; consider skipping or smaller size.`] : [])]; })(), `At ${lev}x: margin about $${Math.round(margin)}, liquidation roughly ${liqPct.toFixed(2)}% away (estimate)`, ...(stopPct > CFG.liqSafety * liqPct ? [`WARNING: stop (${stopPct.toFixed(2)}%) is too close to liquidation at ${lev}x. Use ${safeLev}x or lower for this trade.`] : []), `ATR ${fmt(atPct)}%`, `Volume Ratio: ${fmt(vr)}x`, `Funding: ${Number.isFinite(funding) ? (funding * 100).toFixed(4) : 0}%`, `RSI 4H/1H/15M: ${fmt(r4)}/${fmt(r1)}/${fmt(r15)}`, '', ...reasons.map(x => `• ${x}`), '', 'Macro Details:', macro.context || '', 'Proposal only; paper-test before live execution.'].join(LF);\n  }\n\n  out.push({ json: { symbol, hasSetup: !!side, side, regime, macroRegime: macro.macro_regime || null, longScore, shortScore, entry, sl, tp, trailPct, stopPct, qty, notional, dailyTrend: daily.trend, dailyStretchAtr: daily.stretchAtr ?? null, dailyCandles: daily.candles, leverage: lev, margin, liqPct, safeLeverage: safeLev, crossAgo: st ? (side === 'long' ? st.upAgo : side === 'short' ? st.downAgo : null) : null, funding, openInterest, atrPct: atPct, volumeRatio: vr, rsi4h: r4, rsi1h: r1, rsi15m: r15, reasons, rejectionReasons: reject, message } });\n}\n\n/* ---- v2: batch limit + cooldown ---- */\n/* Cooldown uses workflow static data, which is saved only when the workflow is ACTIVE (not in manual test runs). */\nlet sd = {}; try { sd = $getWorkflowStaticData('global'); } catch (e) {}\nsd.lastSignal = sd.lastSignal || {};\nconst nowMs = Date.now(), counts = { long: 0, short: 0 };\nconst block = (j, why) => { j.rejectionReasons.push(why); j.blockedSide = j.side; j.hasSetup = false; j.side = null; j.message = ''; };\nout.filter(o => o.json.hasSetup)\n  .sort((a, b) => (Math.max(b.json.longScore, b.json.shortScore) - Math.max(a.json.longScore, a.json.shortScore)) || (a.json.crossAgo - b.json.crossAgo) || (b.json.volumeRatio - a.json.volumeRatio))\n  .forEach(o => {\n    const j = o.json, key = j.symbol + ':' + j.side, prev = sd.lastSignal[key];\n    if (prev && nowMs - prev < CFG.cooldownHours * 3600e3) return block(j, `Cooldown: same alert ${((nowMs - prev) / 3600e3).toFixed(1)}h ago`);\n    if (counts[j.side] >= CFG.maxSignalsPerSide) return block(j, `Batch limit: already ${CFG.maxSignalsPerSide} ${j.side} alerts this run`);\n    counts[j.side]++; sd.lastSignal[key] = nowMs;\n  });\nreturn out;"
+      },
+      "id": "a554e3f3-76d4-4bf5-b92c-62e3f37c89ba",
+      "name": "Analyze Setups",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        3808,
+        112
+      ]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "has-setup",
+              "leftValue": "={{ $json.hasSetup }}",
+              "rightValue": true,
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "ae9c2738-be9f-4cd4-9799-02f8dbd6756b",
+      "name": "Has Setup",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        4032,
+        112
+      ]
+    },
+    {
+      "parameters": {
+        "chatId": "Tester_Bot_ID",
+        "text": "={{ $json.message }}",
+        "additionalFields": {}
+      },
+      "id": "979147bd-07ad-48f6-a23d-a3667d43d284",
+      "name": "Send Proposal",
+      "type": "n8n-nodes-base.telegram",
+      "typeVersion": 1.2,
+      "position": [
+        4256,
+        112
+      ],
+      "webhookId": "76227774-9e3d-45d4-8ae3-8338d4416a6c",
+      "credentials": {
+        "telegramApi": {
+          "id": "Cwz5wISzWTP4TKGg",
+          "name": "Telegram account 3"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "rule": {
+          "interval": [
+            {
+              "field": "hours"
+            }
+          ]
+        }
+      },
+      "id": "767c794d-b2df-476e-b430-c702ff3689d0",
+      "name": "Every 1 hour",
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1.2,
+      "position": [
+        160,
+        128
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "const out = [];\n\nconst symbols =\n    $('Build Symbols').all();\n\nconst oiItems =\n    $('Open Interest').all();\n\nconst fundingItems =\n    $('Funding Rate').all();\n\nconst candles15m =\n    $('Candles 15m').all();\n\nfor(let i = 0; i < symbols.length; i++){\n\n    const symbol =\n        symbols[i]?.json?.symbol || null;\n\n    let openInterest = null;\n    let fundingRate = null;\n    let price = null;\n\n    try{\n        openInterest = Number(\n            oiItems[i]\n                .json\n                .data\n                .openInterestList?.[0]\n                ?.size\n        );\n    }catch(e){}\n\n    try{\n        fundingRate = Number(\n            fundingItems[i]\n                .json\n                .data?.[0]\n                ?.fundingRate\n        );\n    }catch(e){}\n\n    try{\n\n        const candles =\n            candles15m[i]\n                .json\n                .data;\n\n        const lastCandle =\n            candles[candles.length - 1];\n\n        price = Number(\n            lastCandle[4]\n        );\n\n    }catch(e){}\n\n    out.push({\n        json:{\n            captured_at:\n                new Date()\n                    .toISOString(),\n\n            symbol,\n\n            price,\n\n            open_interest:\n                openInterest,\n\n            funding_rate:\n                fundingRate\n        }\n    });\n\n}\n\nreturn out;"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        3344,
+        224
+      ],
+      "id": "0cdbd102-6158-4c51-abaf-f79b6b811816",
+      "name": "Prepare Derivatives History"
+    },
+    {
+      "parameters": {
+        "dataTableId": {
+          "__rl": true,
+          "value": "eu2nYLYeeG8pWu1r",
+          "mode": "list",
+          "cachedResultName": "crypto_derivatives_history",
+          "cachedResultUrl": "/projects/PGcyPJFZfgLHVw8U/datatables/eu2nYLYeeG8pWu1r"
+        },
+        "columns": {
+          "mappingMode": "defineBelow",
+          "value": {
+            "captured_at": "={{ $json.captured_at }}",
+            "symbol": "={{ $json.symbol }}",
+            "price": "={{ $json.price }}",
+            "open_interest": "={{ $json.open_interest }}",
+            "funding_rate": "={{ $json.funding_rate }}"
+          },
+          "matchingColumns": [],
+          "schema": [
+            {
+              "id": "captured_at",
+              "displayName": "captured_at",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "dateTime",
+              "readOnly": false,
+              "removed": false
+            },
+            {
+              "id": "symbol",
+              "displayName": "symbol",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "readOnly": false,
+              "removed": false
+            },
+            {
+              "id": "price",
+              "displayName": "price",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "number",
+              "readOnly": false,
+              "removed": false
+            },
+            {
+              "id": "open_interest",
+              "displayName": "open_interest",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "number",
+              "readOnly": false,
+              "removed": false
+            },
+            {
+              "id": "funding_rate",
+              "displayName": "funding_rate",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "number",
+              "readOnly": false,
+              "removed": false
+            }
+          ],
+          "attemptToConvertTypes": false,
+          "convertFieldsToString": false
+        },
+        "options": {}
+      },
+      "type": "n8n-nodes-base.dataTable",
+      "typeVersion": 1.1,
+      "position": [
+        3536,
+        224
+      ],
+      "id": "f5976c0a-43a2-41fc-83db-d79d935923ee",
+      "name": "Save Derivatives History"
+    },
+    {
+      "parameters": {
+        "url": "=https://api.bitget.com/api/v2/mix/market/history-candles?symbol={{ $('Build Symbols').item.json.symbol }}&granularity=1D&productType=usdt-futures&limit=200",
+        "options": {
+          "batching": {
+            "batch": {
+              "batchSize": 1,
+              "batchInterval": 500
+            }
+          }
+        }
+      },
+      "id": "320b0b85-9718-4129-b319-b6997783fa86",
+      "name": "Candles 1d",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        1984,
+        128
+      ],
+      "retryOnFail": true,
+      "waitBetweenTries": 2000,
+      "onError": "continueRegularOutput"
+    },
+    {
+      "parameters": {
+        "url": "=https://api.bitget.com/api/v2/mix/market/history-candles?symbol={{ $('Build Symbols').item.json.symbol }}&granularity=1D&productType=usdt-futures&limit=200&endTime={{ Math.min(...$json.data.map(r => Number(r[0]))) }}",
+        "options": {
+          "batching": {
+            "batch": {
+              "batchSize": 1,
+              "batchInterval": 500
+            }
+          }
+        }
+      },
+      "id": "451a66ce-38c9-48b7-a911-acb7b8aec7ac",
+      "name": "Candles 1d older",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        2160,
+        128
+      ],
+      "retryOnFail": true,
+      "waitBetweenTries": 2000,
+      "onError": "continueRegularOutput"
+    },
+    {
+      "parameters": {
+        "url": "=https://api.bitget.com/api/v2/mix/market/history-candles?symbol={{ $('Build Symbols').item.json.symbol }}&granularity=1D&productType=usdt-futures&limit=200&endTime={{ Math.min(...$json.data.map(r => Number(r[0]))) }}",
+        "options": {
+          "batching": {
+            "batch": {
+              "batchSize": 1,
+              "batchInterval": 500
+            }
+          }
+        }
+      },
+      "id": "61c51fc7-0bfc-4711-b6c4-f63bbc9a9a79",
+      "name": "Candles 1d older 2",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        2304,
+        128
+      ],
+      "retryOnFail": true,
+      "waitBetweenTries": 2000,
+      "onError": "continueRegularOutput"
+    }
+  ],
+  "pinData": {},
+  "connections": {
+    "CoinGecko Global": {
+      "main": [
+        [
+          {
+            "node": "Bitget Contracts",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Bitget Contracts": {
+      "main": [
+        [
+          {
+            "node": "Read Last Dominance",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Read Last Dominance": {
+      "main": [
+        [
+          {
+            "node": "Compute Dominance",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Compute Dominance": {
+      "main": [
+        [
+          {
+            "node": "Save Dominance",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Save Dominance": {
+      "main": [
+        [
+          {
+            "node": "CoinGecko Markets",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "CoinGecko Markets": {
+      "main": [
+        [
+          {
+            "node": "Build Symbols",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Build Symbols": {
+      "main": [
+        [
+          {
+            "node": "Candles 1d",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Candles 4h": {
+      "main": [
+        [
+          {
+            "node": "Candles 1h",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Candles 1h": {
+      "main": [
+        [
+          {
+            "node": "Candles 15m",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Candles 15m": {
+      "main": [
+        [
+          {
+            "node": "Open Interest",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Open Interest": {
+      "main": [
+        [
+          {
+            "node": "Funding Rate",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Funding Rate": {
+      "main": [
+        [
+          {
+            "node": "Prepare Derivatives History",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "Analyze Setups",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Analyze Setups": {
+      "main": [
+        [
+          {
+            "node": "Has Setup",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Has Setup": {
+      "main": [
+        [
+          {
+            "node": "Send Proposal",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Every 1 hour": {
+      "main": [
+        [
+          {
+            "node": "CoinGecko Global",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Prepare Derivatives History": {
+      "main": [
+        []
+      ]
+    },
+    "Candles 1d": {
+      "main": [
+        [
+          {
+            "node": "Candles 1d older",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Candles 1d older": {
+      "main": [
+        [
+          {
+            "node": "Candles 1d older 2",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Save Derivatives History": {
+      "main": [
+        []
+      ]
+    },
+    "Candles 1d older 2": {
+      "main": [
+        [
+          {
+            "node": "Candles 4h",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "active": true,
+  "settings": {
+    "executionOrder": "v1",
+    "binaryMode": "separate",
+    "timeSavedMode": "fixed",
+    "callerPolicy": "workflowsFromSameOwner",
+    "availableInMCP": false
+  },
+  "versionId": "9195b33a-1c4a-4a8d-a5cc-345f176961d2",
+  "meta": {
+    "instanceId": "0ca9c1b427f15ea4d95f03b1d5d7135ad151ea23e9cd403cb1e919cf64c47b14"
+  },
+  "nodeGroups": [
+    {
+      "id": "f7664cc6-c45b-4790-9b4e-cecbcda611f1",
+      "name": "Market Scope",
+      "nodeIds": [
+        "01e1ac60-2ab2-4688-ac9e-1fc7626e8538",
+        "3213b53e-86b1-472b-be45-8169a266cd98",
+        "1520dfb1-67d4-4a31-b062-b917c8e5dff0",
+        "61c52f3f-43ac-4504-a78e-73c035837de1",
+        "eee70614-93ac-4e93-9e2a-3863286d4fbb",
+        "a0681778-a4b9-4b40-9bf6-95a3d274b747",
+        "2dc373bf-4765-4198-84ff-f1a47f7c89a3"
+      ],
+      "description": "Pulls macro dominance (BTC.D / TOTAL2 / TOTAL3) with run-over-run trend, and builds the top-50 market-cap universe filtered to Bitget USDT perps."
+    },
+    {
+      "id": "9875cbc6-5374-41fb-8bce-ce765a3d19f7",
+      "name": "Analysis & Alert",
+      "nodeIds": [
+        "a554e3f3-76d4-4bf5-b92c-62e3f37c89ba",
+        "ae9c2738-be9f-4cd4-9799-02f8dbd6756b",
+        "979147bd-07ad-48f6-a23d-a3667d43d284"
+      ],
+      "description": "Computes EMA trend, Stoch RSI timing, ATR-based risk levels and fib confluence with macro context, then sends LONG/SHORT proposals to Telegram."
+    },
+    {
+      "id": "5c73b950-ad02-4dea-bcea-6fe6989b49ec",
+      "name": "Group 1",
+      "nodeIds": [
+        "f5472ead-dabd-4b7e-a71c-1aa5a18e0c8a",
+        "b2bf8021-cdfa-4275-b44e-fcb7873d88a4",
+        "42008328-eb55-4dff-b12b-689a6f4ceb27",
+        "53c7f355-fbe1-4c54-8fc9-b83f2e77fb65",
+        "da9c0cd8-369a-4833-943c-4a067287de33",
+        "320b0b85-9718-4129-b319-b6997783fa86",
+        "451a66ce-38c9-48b7-a911-acb7b8aec7ac",
+        "61c51fc7-0bfc-4711-b6c4-f63bbc9a9a79"
+      ]
+    }
+  ],
+  "id": "XRDcHbsDDa0iQZvu",
+  "tags": []
+}
